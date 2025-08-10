@@ -1,5 +1,7 @@
 ﻿# Mahjong Layout Editor Prototype
 
+![Demo](vibe_mahjong.gif)
+
 ## 📜 Project Description
 
 This project is a **Mahjong tile layout editor prototype** built with the **Defold** game engine.
