@@ -1,0 +1,139 @@
+images {
+  image: "/assets/tile_1.png"
+}
+images {
+  image: "/assets/tile_2.png"
+}
+images {
+  image: "/assets/tile_3.png"
+}
+images {
+  image: "/assets/tile_4.png"
+}
+images {
+  image: "/assets/tile_5.png"
+}
+images {
+  image: "/assets/tile_6.png"
+}
+images {
+  image: "/assets/tile_7.png"
+}
+images {
+  image: "/assets/tile_8.png"
+}
+images {
+  image: "/assets/tile_9.png"
+}
+images {
+  image: "/assets/tile_10.png"
+}
+images {
+  image: "/assets/tile_11.png"
+}
+images {
+  image: "/assets/tile_12.png"
+}
+images {
+  image: "/assets/tile_13.png"
+}
+images {
+  image: "/assets/tile_14.png"
+}
+images {
+  image: "/assets/tile_15.png"
+}
+images {
+  image: "/assets/tile_16.png"
+}
+images {
+  image: "/assets/tile_17.png"
+}
+images {
+  image: "/assets/tile_18.png"
+}
+images {
+  image: "/assets/tile_19.png"
+}
+images {
+  image: "/assets/tile_20.png"
+}
+images {
+  image: "/assets/tile_21.png"
+}
+images {
+  image: "/assets/tile_22.png"
+}
+images {
+  image: "/assets/tile_23.png"
+}
+images {
+  image: "/assets/tile_24.png"
+}
+images {
+  image: "/assets/tile_25.png"
+}
+images {
+  image: "/assets/tile_26.png"
+}
+images {
+  image: "/assets/tile_27.png"
+}
+images {
+  image: "/assets/tile_28.png"
+}
+images {
+  image: "/assets/tile_29.png"
+}
+images {
+  image: "/assets/tile_30.png"
+}
+images {
+  image: "/assets/tile_31.png"
+}
+images {
+  image: "/assets/tile_32.png"
+}
+images {
+  image: "/assets/tile_33.png"
+}
+images {
+  image: "/assets/tile_34.png"
+}
+images {
+  image: "/assets/tile_35.png"
+}
+images {
+  image: "/assets/tile_36.png"
+}
+images {
+  image: "/assets/tile_37.png"
+}
+images {
+  image: "/assets/tile_38.png"
+}
+images {
+  image: "/assets/tile_39.png"
+}
+images {
+  image: "/assets/tile_40.png"
+}
+images {
+  image: "/assets/tile_41.png"
+}
+images {
+  image: "/assets/tile_42.png"
+}
+images {
+  image: "/assets/tile_debug.png"
+}
+images {
+  image: "/assets/tile_empty.png"
+}
+images {
+  image: "/assets/tile_empty_v2.png"
+}
+images {
+  image: "/assets/tile_empty_v3.png"
+}
+margin: 2

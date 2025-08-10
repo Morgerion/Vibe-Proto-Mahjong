@@ -1,0 +1,804 @@
+-- main.gui_script
+-- Mahjong (editor + play) + ImGUI toolbar.
+
+local style = require("main.imgui.style")
+local fonts = require("main.imgui.fonts")
+
+-- ================= Constants / Settings =================
+-- BIG_W, BIG_H define the coarse grid size (a "big" cell is 2x2 small cells).
+local BIG_W, BIG_H = 15, 10             -- coarse grid dimensions
+local Z_MAX = 12                         -- maximum number of stacked layers
+local ATLAS_ID = hash("tiles")
+local TILE_EMPTY_ID = hash("tile_empty")
+
+-- Face sprite ids: tile_1 .. tile_42
+local FACE_IDS = {}
+for i=1,42 do FACE_IDS[i] = hash("tile_"..i) end
+
+-- Colors
+local COLOR_WHITE = vmath.vector4(1, 1, 1, 1)
+local COLOR_PICK1 = vmath.vector4(0.8, 0.95, 1.0, 1.0) -- selection tint in play mode
+
+-- ================= Geometry (dynamic) =================
+-- These pixel sizes are recomputed every frame to keep tiles fitting on screen.
+local TILE_PX_W, TILE_PX_H = 96, 128     -- initial, recalculated later
+local SMALL_PX_W, SMALL_PX_H = TILE_PX_W/2, TILE_PX_H/2
+local TILE_ASPECT = 128/96               -- tile height/width ratio to match sprites
+local PADDING_FRAC = 0.1                 -- screen padding: 10% of the shorter screen side
+
+-- Dynamic origin in pixels (top-left of the "small" grid rectangle for the base layer).
+-- All tile positions derive from this origin + small-cell strides.
+local dyn_origin_ox, dyn_origin_oy = 0, 0
+
+-- Modes
+local MODE_EDITOR = 1
+local MODE_PLAY   = 2
+
+-- ================= Utilities =================
+
+-- Convert coarse grid (bx, by) on layer z into "small" grid (sx, sy).
+-- Each layer is offset by +1 small cell both in X and Y, which creates the visual
+-- "staircase" shift used by Mahjong stacks.
+local function to_small(bx, by, z)
+	return 2*bx + z, 2*by + z
+end
+
+-- Pixel position (center of tile node) from coarse grid coordinates.
+local function to_px(bx, by, z)
+	local sx, sy = to_small(bx, by, z)
+	local px = dyn_origin_ox + sx * SMALL_PX_W + (2 * SMALL_PX_W) * 0.5
+	local py = dyn_origin_oy + sy * SMALL_PX_H + (2 * SMALL_PX_H) * 0.5
+	return px, py
+end
+
+-- Stable numeric ordering key for tiles.
+-- Larger z should render on top; within the same z, Y then X decide the order.
+-- We use it together with gui.move_above to emulate z-ordering in Defold GUI.
+local function z_order(bx, by, z)
+	return z * 100000 + by * 100 + bx
+end
+
+-- Axis-aligned rectangle intersection on small-grid coordinates.
+local function rects_intersect(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1)
+	return not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0)
+end
+
+-- ================= State =================
+local state = {
+	mode = MODE_EDITOR,
+
+	-- Tile records:
+	-- tiles = {
+	--   { id, bx, by, z, face (nil|1..42), node, alive=true },
+	--   ...
+	-- }
+	tiles = {},
+
+	-- Occupancy grid (by layer -> row -> column) pointing to tile id:
+	-- occ[z][by][bx] = id
+	occ = {},
+
+	selected = nil,        -- currently selected tile id in play mode
+	timer = 0,             -- elapsed time while playing
+	score = 0,             -- pairs removed
+	random_seed = 123456,  -- used to assign faces from a generated route
+	show_msg = nil,        -- transient UI message (toolbar)
+
+	-- Ghost preview tile under the cursor (editor only).
+	-- It's a semi-transparent node that shows where a tile would be added.
+	ghost = { node = nil, visible = false, flip = hash("tile_debug"), alpha = 0.35 },
+
+	-- Anchor node to enforce deterministic render order via gui.move_above.
+	anchor = nil,
+
+	-- Base-layer grid visualization (coarse grid only).
+	grid = {
+		root = nil,
+		v = {},           -- vertical lines BIG_W+1
+		h = {},           -- horizontal lines BIG_H+1
+		color = vmath.vector4(1, 1, 1, 0.08),
+		thickness = 2
+	},
+}
+
+-- Ensure occupancy table exists for layer z
+local function ensure_occ_layer(z)
+	state.occ[z] = state.occ[z] or {}
+	for by=0,BIG_H-1 do
+		state.occ[z][by] = state.occ[z][by] or {}
+	end
+end
+
+-- Read/write helpers for occupancy
+local function occ_get(z, bx, by)
+	local l = state.occ[z]; if not l then return nil end
+	local r = l[by]; if not r then return nil end
+	return r[bx]
+end
+
+local function occ_set(z, bx, by, id)
+	ensure_occ_layer(z)
+	state.occ[z][by][bx] = id
+end
+
+-- Rebuild occupancy from the current alive tiles.
+local function rebuild_occ()
+	state.occ = {}
+	for _,t in ipairs(state.tiles) do
+		if t.alive then occ_set(t.z, t.bx, t.by, t.id) end
+	end
+end
+
+-- ================= Dynamic layout (scale and origin) =================
+-- Compute the small-grid bounds for the base layer (z=0).
+-- We intentionally ignore actual tile occupancy here and size the layout so that the
+-- entire coarse grid fits the screen with a nice padding, preserving tile aspect ratio.
+local function compute_small_bounds()
+	-- Base layer in "small" cells: width = 2*BIG_W, height = 2*BIG_H
+	local min_sx, min_sy = 0, 0
+	local span_x = 2 * BIG_W
+	local span_y = 2 * BIG_H
+	return min_sx, min_sy, span_x, span_y
+end
+
+-- Recompute pixel sizes for SMALL_PX_W/H and TILE_PX_W/H and the dynamic origin.
+-- Keeps tiles on screen with constant aspect, centered within padded area.
+local function recompute_layout_metrics()
+	local sw = gui.get_width() or 1920
+	local sh = gui.get_height() or 1080
+	local padding = math.floor(math.min(sw, sh) * PADDING_FRAC + 0.5)
+	local avail_w = math.max(1, sw - 2*padding)
+	local avail_h = math.max(1, sh - 2*padding)
+
+	local min_sx, min_sy, span_x, span_y = compute_small_bounds()
+
+	-- Maintain tile aspect: SMALL_PX_H = TILE_ASPECT * SMALL_PX_W.
+	-- Fit by whichever dimension is limiting.
+	local small_w_by_w = avail_w / span_x
+	local small_w_by_h = (avail_h / span_y) / TILE_ASPECT
+	SMALL_PX_W = math.floor(math.min(small_w_by_w, small_w_by_h))
+	if SMALL_PX_W < 1 then SMALL_PX_W = 1 end
+	SMALL_PX_H = SMALL_PX_W * TILE_ASPECT
+	TILE_PX_W  = SMALL_PX_W * 2
+	TILE_PX_H  = SMALL_PX_H * 2
+
+	local total_w = span_x * SMALL_PX_W
+	local total_h = span_y * SMALL_PX_H
+
+	-- Center the base-layer rectangle within the available area.
+	dyn_origin_ox = padding + (avail_w - total_w) * 0.5 - min_sx * SMALL_PX_W
+	dyn_origin_oy = padding + (avail_h - total_h) * 0.5 - min_sy * SMALL_PX_H
+end
+
+-- ================= Tile GUI nodes =================
+-- Create a GUI node for a tile and set its initial sprite and position.
+local function create_tile_node(t)
+	local node = gui.new_box_node(vmath.vector3(0), vmath.vector3(TILE_PX_W, TILE_PX_H, 0))
+	gui.set_pivot(node, gui.PIVOT_CENTER)
+	gui.set_texture(node, ATLAS_ID)
+	if t.face then
+		gui.play_flipbook(node, FACE_IDS[t.face])
+	else
+		gui.play_flipbook(node, TILE_EMPTY_ID)
+	end
+	local px, py = to_px(t.bx, t.by, t.z)
+	gui.set_position(node, vmath.vector3(px, py, 0))
+	gui.set_color(node, COLOR_WHITE)
+	return node
+end
+
+-- Safely delete the GUI node of a tile (if any) and clear the reference.
+local function delete_tile_node(t)
+	if t and t.node then
+		gui.delete_node(t.node)
+		t.node = nil
+	end
+end
+
+-- Update the sprite (face) of a tile node according to its face value.
+local function refresh_tile_visual(t)
+	if not t.alive or not t.node then return end
+	gui.play_flipbook(t.node, t.face and FACE_IDS[t.face] or TILE_EMPTY_ID)
+end
+
+-- ======= Ghost (preview) tile control (editor only) =======
+local function ghost_hide()
+	if state.ghost.node and state.ghost.visible then
+		gui.set_enabled(state.ghost.node, false)
+		state.ghost.visible = false
+	end
+end
+
+-- Show ghost at (bx,by,z) with the current scale.
+-- The ghost is kept between the grid and real tiles so it doesn’t block picking.
+local function ghost_show_at(bx, by, z)
+	if not state.ghost.node then return end
+	local px, py = to_px(bx, by, z)
+	gui.set_position(state.ghost.node, vmath.vector3(px, py, 0))
+	gui.set_size(state.ghost.node, vmath.vector3(TILE_PX_W, TILE_PX_H, 0))
+	if state.grid.root then gui.move_above(state.ghost.node, state.grid.root) end
+	if not state.ghost.visible then
+		gui.set_enabled(state.ghost.node, true)
+		state.ghost.visible = true
+	end
+end
+
+-- Is there any support beneath a potential tile at (bx,by,z)?
+-- On z==0 we only require the position to be inside the base coarse grid.
+-- For z>0 we require at least one overlapping 1x1 small-cell intersection with any
+-- tile on (z-1). This prevents "floating" tiles in mid air.
+local function has_support(bx, by, z)
+	if z == 0 then
+		return (bx >= 0 and bx < BIG_W and by >= 0 and by < BIG_H)
+	end
+	local sx, sy = to_small(bx, by, z)
+	local ax0, ay0, ax1, ay1 = sx, sy, sx+1, sy+1
+	local below = z - 1
+	for _,t in ipairs(state.tiles) do
+		if t.alive and t.z == below then
+			local bx0, by0 = to_small(t.bx, t.by, t.z)
+			if rects_intersect(ax0, ay0, ax1, ay1, bx0, by0, bx0+1, by0+1) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- ================= Pseudo Z-Order via move_above =================
+-- We keep an invisible "anchor" node at the very bottom and then move tiles
+-- above each other in a deterministic order every frame.
+local function ensure_anchor()
+	if not state.anchor then
+		state.anchor = gui.new_box_node(vmath.vector3(0), vmath.vector3(1,1,0))
+		gui.set_alpha(state.anchor, 0)
+	end
+end
+
+-- Sort alive tile nodes by our numeric z_order and stack them via gui.move_above.
+local function apply_render_order()
+	local list = {}
+	for _,t in ipairs(state.tiles) do
+		if t.alive and t.node then
+			list[#list+1] = t
+		end
+	end
+	table.sort(list, function(a,b)
+		return z_order(a.bx,a.by,a.z) < z_order(b.bx,b.by,b.z)
+	end)
+	local prev = state.anchor
+	for _,t in ipairs(list) do
+		gui.move_above(t.node, prev)
+		prev = t.node
+	end
+end
+
+-- ================= Base-layer grid (visual helper) =================
+-- Lazily create the invisible root and individual line nodes (vertical and horizontal).
+-- The grid sits above the anchor but below the tiles (tiles are moved above later).
+local function ensure_grid_nodes()
+	if not state.grid.root then
+		state.grid.root = gui.new_box_node(vmath.vector3(0), vmath.vector3(1,1,0))
+		gui.set_alpha(state.grid.root, 0)
+		gui.move_above(state.grid.root, state.anchor or state.grid.root)
+	end
+	for i=1, BIG_W+1 do
+		if not state.grid.v[i] then
+			local n = gui.new_box_node(vmath.vector3(0), vmath.vector3(1,1,0))
+			gui.set_color(n, state.grid.color)
+			gui.move_above(n, state.grid.root)
+			state.grid.v[i] = n
+		end
+	end
+	for j=1, BIG_H+1 do
+		if not state.grid.h[j] then
+			local n = gui.new_box_node(vmath.vector3(0), vmath.vector3(1,1,0))
+			gui.set_color(n, state.grid.color)
+			gui.move_above(n, state.grid.root)
+			state.grid.h[j] = n
+		end
+	end
+end
+
+-- Position and size the grid lines to match the current dynamic layout.
+local function layout_grid()
+	if not state.grid.root then return end
+	local thick = state.grid.thickness
+
+	-- Top-left corner of the coarse cell (bx,by) at z=0 in pixels.
+	local function big_cell_top_left(bx, by)
+		local cx = dyn_origin_ox + (2*bx) * SMALL_PX_W + (2*SMALL_PX_W)*0.5
+		local cy = dyn_origin_oy + (2*by) * SMALL_PX_H + (2*SMALL_PX_H)*0.5
+		return cx - (2*SMALL_PX_W)*0.5, cy - (2*SMALL_PX_H)*0.5
+	end
+	local x0, y0 = big_cell_top_left(0,0)
+	local total_w = BIG_W * (2*SMALL_PX_W)
+	local total_h = BIG_H * (2*SMALL_PX_H)
+
+	-- Vertical lines
+	for i=0, BIG_W do
+		local node = state.grid.v[i+1]
+		local x = x0 + i * (2*SMALL_PX_W)
+		gui.set_position(node, vmath.vector3(x, y0 + total_h/2, 0))
+		gui.set_size(node, vmath.vector3(thick, total_h, 0))
+	end
+	-- Horizontal lines
+	for j=0, BIG_H do
+		local node = state.grid.h[j+1]
+		local y = y0 + j * (2*SMALL_PX_H)
+		gui.set_position(node, vmath.vector3(x0 + total_w/2, y, 0))
+		gui.set_size(node, vmath.vector3(total_w, thick, 0))
+	end
+end
+
+-- ================= Free/blocked checks =================
+-- Returns true if tile t is covered by ANY tile exactly one layer above (z+1)
+-- with at least a 1x1 small-cell overlap. Covered tiles are not removable.
+local function is_covered_from_above(t)
+	if not t.alive then return true end
+	local sx, sy = to_small(t.bx, t.by, t.z)
+	local ax0, ay0, ax1, ay1 = sx, sy, sx+1, sy+1
+	local above = t.z + 1
+	for _,o in ipairs(state.tiles) do
+		if o.alive and o.z == above then
+			local bx0, by0 = to_small(o.bx, o.by, o.z)
+			if rects_intersect(ax0,ay0,ax1,ay1, bx0,by0,bx0+1,by0+1) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+-- True if the tile has at least one free orthogonal neighbor on its own layer
+-- (left/right/top/bottom inside the coarse grid), based on the occupancy map.
+local function side_free_on_layer(t)
+	if not t.alive then return false end
+	local z, bx, by = t.z, t.bx, t.by
+	local left_free   = (bx-1 < 0) or (occ_get(z, bx-1, by) == nil)
+	local right_free  = (bx+1 >= BIG_W) or (occ_get(z, bx+1, by) == nil)
+	local top_free    = (by-1 < 0) or (occ_get(z, bx, by-1) == nil)
+	local bottom_free = (by+1 >= BIG_H) or (occ_get(z, bx, by+1) == nil)
+	return (left_free or right_free or top_free or bottom_free)
+end
+
+-- A tile is "free" (removable) if it's NOT covered from above and has at least
+-- one free side on its layer.
+local function is_tile_free(t)
+	if is_covered_from_above(t) then return false end
+	return side_free_on_layer(t)
+end
+
+-- Quick scan to see if there exists at least one pair of free tiles with the same face.
+local function has_moves_play()
+	local free_by_face = {}
+	for _,t in ipairs(state.tiles) do
+		if t.alive and t.face and is_tile_free(t) then
+			local c = (free_by_face[t.face] or 0) + 1
+			if c >= 2 then return true end
+			free_by_face[t.face] = c
+		end
+	end
+	return false
+end
+
+-- ================= Route generation and face assignment =================
+-- Build a valid removal route: repeatedly pick TWO currently-free tiles and
+-- record the pair, removing them virtually from the "alive" set. If at some step
+-- fewer than two free tiles exist, the layout is unsolvable.
+-- Returns: route (array of {idA, idB}) or nil + error message.
+local function build_removal_route()
+	local alive = {}
+	for _,t in ipairs(state.tiles) do alive[t.id] = t.alive end
+
+	local function tile_by_id(id)
+		for _,t in ipairs(state.tiles) do if t.id==id then return t end end
+	end
+	local function is_alive(id) return alive[id] end
+
+	local function covered(id)
+		local t = tile_by_id(id); if not is_alive(id) then return true end
+		local sx, sy = to_small(t.bx,t.by,t.z)
+		local ax0, ay0, ax1, ay1 = sx,sy,sx+1,sy+1
+		local above = t.z + 1
+		for _,o in ipairs(state.tiles) do
+			if is_alive(o.id) and o.z == above then
+				local bx0, by0 = to_small(o.bx,o.by,o.z)
+				if rects_intersect(ax0,ay0,ax1,ay1, bx0,by0,bx0+1,by0+1) then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	local function side_free(id)
+		local t = tile_by_id(id); if not is_alive(id) then return false end
+		local z,bx,by = t.z,t.bx,t.by
+
+		-- Local occupancy lookup limited to "alive" tiles only.
+		local function occ_id(z, bx, by)
+			for _,o in ipairs(state.tiles) do
+				if is_alive(o.id) and o.z==z and o.bx==bx and o.by==by then return o.id end
+			end
+			return nil
+		end
+
+		local left_free   = (bx-1 < 0) or (occ_id(z,bx-1,by)==nil)
+		local right_free  = (bx+1 >= BIG_W) or (occ_id(z,bx+1,by)==nil)
+		local top_free    = (by-1 < 0) or (occ_id(z,bx,by-1)==nil)
+		local bottom_free = (by+1 >= BIG_H) or (occ_id(z,bx,by+1)==nil)
+		return (left_free or right_free or top_free or bottom_free)
+	end
+
+	local remaining = 0
+	for _,t in ipairs(state.tiles) do if t.alive then remaining = remaining + 1 end end
+	if remaining % 2 == 1 then
+		return nil, "Odd number of tiles — add one more in the editor"
+	end
+
+	local route = {}
+	while remaining > 0 do
+		local free = {}
+		for _,t in ipairs(state.tiles) do
+			if is_alive(t.id) and (not covered(t.id)) and side_free(t.id) then
+				free[#free+1] = t.id
+			end
+		end
+		if #free < 2 then
+			return nil, "Topology yields < 2 free tiles — layout is unsolvable"
+		end
+		local a, b = free[1], free[2]
+		route[#route+1] = {a,b}
+		alive[a], alive[b] = false, false
+		remaining = remaining - 2
+	end
+	return route
+end
+
+-- Assign faces according to a valid removal route so that each recorded pair
+-- shares the same face value. Random is seeded from state.random_seed.
+local function assign_faces_from_route(route)
+	for _,t in ipairs(state.tiles) do
+		if t.alive then
+			t.face=nil
+			refresh_tile_visual(t)
+		end
+	end
+	math.randomseed(state.random_seed)
+	for _,pair in ipairs(route) do
+		local face = math.random(1, #FACE_IDS)
+		for _,id in ipairs(pair) do
+			local t = state.tiles[id]
+			if t and t.alive then
+				t.face = face
+				refresh_tile_visual(t)
+			end
+		end
+	end
+end
+
+-- ================= Play mode: selection and removal =================
+-- Pick the visually topmost alive tile under (x,y).
+-- We build a list and sort by descending z_order to emulate "topmost hit".
+local function try_pick_tile(x, y)
+	local list = {}
+	for _,t in ipairs(state.tiles) do
+		if t.alive then list[#list+1] = t end
+	end
+	table.sort(list, function(a,b)
+		return z_order(a.bx,a.by,a.z) > z_order(b.bx,b.by,b.z)
+	end)
+	for _,t in ipairs(list) do
+		if t.node and gui.pick_node(t.node, x, y) then
+			return t
+		end
+	end
+	return nil
+end
+
+-- Remove tile: mark dead, delete node, clear occupancy.
+local function remove_tile(t)
+	if not t.alive then return end
+	t.alive = false
+	delete_tile_node(t)
+	occ_set(t.z, t.bx, t.by, nil)
+end
+
+-- Try to remove a pair: both must be alive, free, distinct ids, and share the same face.
+-- On success, increments score and returns true.
+local function try_remove_pair(a, b)
+	if not a or not b or a.id == b.id then return false end
+	if (not a.alive) or (not b.alive) then return false end
+	if (not is_tile_free(a)) or (not is_tile_free(b)) then return false end
+	if a.face and b.face and a.face == b.face then
+		remove_tile(a); remove_tile(b)
+		state.score = state.score + 1
+		return true
+	end
+	return false
+end
+
+-- ================= Save / Load =================
+local SAVE_KEY = "mahjong_layout"
+
+-- Save alive tiles and basic state to a Defold sys.save() slot.
+local function save_json()
+	local data = {
+		version = 1,
+		grid = { big_w=BIG_W, big_h=BIG_H },
+		seed = state.random_seed,
+		mode = state.mode,
+		tiles = {}
+	}
+	for _,t in ipairs(state.tiles) do
+		if t.alive then
+			data.tiles[#data.tiles+1] = { bx=t.bx, by=t.by, z=t.z, face=t.face }
+		end
+	end
+	sys.save(SAVE_KEY, data)
+	state.show_msg = "Saved"
+end
+
+-- Delete all tile GUI nodes without touching the logical array.
+local function clear_all_nodes()
+	for _,t in ipairs(state.tiles) do
+		if t.node then
+			delete_tile_node(t)
+		end
+	end
+end
+
+-- Load state back from sys.load(). Recreates tile nodes and occupancy.
+local function load_json()
+	local data = sys.load(SAVE_KEY)
+	if not next(data) then state.show_msg = "No save found"; return end
+	clear_all_nodes()
+	state.tiles, state.selected, state.score, state.timer = {}, nil, 0, 0
+	state.random_seed = data.seed or 123456
+	for _,item in ipairs(data.tiles or {}) do
+		local id = #state.tiles + 1
+		local t = { id=id, bx=item.bx, by=item.by, z=item.z, face=item.face, node=nil, alive=true }
+		t.node = create_tile_node(t)
+		table.insert(state.tiles, t)
+	end
+	rebuild_occ()
+	state.mode = MODE_EDITOR
+	state.show_msg = "Loaded (editor)"
+end
+
+-- Start a brand-new empty layout (editor mode).
+local function new_layout()
+	clear_all_nodes()
+	state.tiles, state.selected, state.score, state.timer = {}, nil, 0, 0
+	state.mode, state.random_seed, state.occ = MODE_EDITOR, 123456, {}
+	state.show_msg = "New"
+end
+
+-- ================= ImGUI (toolbar) =================
+local function draw_toolbar(dt)
+	imgui.begin_window("Mahjong", true, imgui.WINDOWFLAGS_ALWAYSAUTORESIZE)
+
+	imgui.text(state.mode == MODE_EDITOR and "Mode: Editor" or "Mode: Play")
+	imgui.separator()
+
+	if imgui.button("New") then new_layout() end
+	imgui.same_line()
+	if imgui.button("Save") then save_json() end
+	imgui.same_line()
+	if imgui.button("Load") then load_json() end
+
+	imgui.separator()
+
+	if state.mode == MODE_EDITOR then
+		local alive = 0
+		for _,t in ipairs(state.tiles) do if t.alive then alive = alive + 1 end end
+		imgui.text(string.format("Tiles: %d %s", alive, (alive%2==1) and "(ODD)" or ""))
+		local changed, seed = imgui.input_int("Seed", state.random_seed)
+		if changed then state.random_seed = seed end
+
+		if imgui.button("Play") then
+			local ok, msg = true, nil
+			if alive == 0 then ok=false; msg="No tiles" end
+			if alive % 2 == 1 then ok=false; msg="Odd number of tiles" end
+			if ok then
+				local route, err = build_removal_route()
+				if not route then
+					state.show_msg = err or "Unsolvable layout"
+				else
+					assign_faces_from_route(route)
+					state.mode = MODE_PLAY
+					state.score, state.timer, state.selected = 0, 0, nil
+					state.show_msg = "Game started"
+				end
+			else
+				state.show_msg = msg
+			end
+		end
+	else
+		if imgui.button("Stop (to Editor)") then
+			state.mode, state.selected = MODE_EDITOR, nil
+			state.show_msg = "Back to editor"
+		end
+		imgui.text(string.format("Score: %d", state.score))
+		imgui.text(string.format("Time: %.1f", state.timer))
+	end
+
+	if state.show_msg then
+		imgui.separator()
+		imgui.text_colored(state.show_msg, 1, 0.8, 0.2, 1)
+	end
+
+	imgui.end_window()
+end
+
+-- ================= GUI lifecycle =================
+function init(self)
+	state.mode = MODE_EDITOR
+	msg.post(".", "acquire_input_focus")
+
+	-- Apply ImGui style and font setup
+	style.set()
+	fonts.load()
+
+	-- Ensure render-order anchor and base grid exist
+	ensure_anchor()
+	ensure_grid_nodes()
+
+	-- Create the ghost tile node (editor preview), initially hidden
+	if not state.ghost.node then
+		local n = gui.new_box_node(vmath.vector3(0), vmath.vector3(TILE_PX_W, TILE_PX_H, 0))
+		gui.set_pivot(n, gui.PIVOT_CENTER)
+		gui.set_texture(n, ATLAS_ID)
+		gui.play_flipbook(n, state.ghost.flip)
+		gui.set_color(n, vmath.vector4(1,1,1, state.ghost.alpha))
+		gui.set_enabled(n, false)  -- hidden by default
+		-- Place the ghost ABOVE the grid but BELOW tiles (so it won't block picking).
+		gui.move_above(n, state.grid.root or n)
+		state.ghost.node = n
+	end
+end
+
+function final(self)
+	clear_all_nodes()
+end
+
+-- ================= Coordinate helpers =================
+-- Screen (pixels) -> coarse cell (bx,by) at a specific layer z (accounting for the z shift).
+local function screen_to_big_cell_at_layer(x, y, z)
+	local sx = math.floor((x - dyn_origin_ox) / SMALL_PX_W)
+	local sy = math.floor((y - dyn_origin_oy) / SMALL_PX_H)
+	-- Inverse of to_small: 2*bx + z ≈ sx  →  bx = floor((sx - z)/2)
+	local bx = math.floor((sx - z) / 2)
+	local by = math.floor((sy - z) / 2)
+	return bx, by
+end
+
+-- Find the first valid add slot under the cursor, scanning z from 0..Z_MAX.
+-- The candidate must be within the base coarse bounds AND have support (see has_support()).
+local function find_add_slot_from_screen(x, y)
+	for z = 0, Z_MAX do
+		local bx, by = screen_to_big_cell_at_layer(x, y, z)
+		if bx >= 0 and bx < BIG_W and by >= 0 and by < BIG_H then
+			if not occ_get(z, bx, by) and has_support(bx, by, z) then
+				return bx, by, z
+			end
+		end
+	end
+	return nil
+end
+
+-- Editor: add a tile under the cursor at the first valid z.
+local function add_tile_from_screen(x, y)
+	local bx, by, z = find_add_slot_from_screen(x, y)
+	if not bx then
+		state.show_msg = "No space (layer limit reached)"
+		return
+	end
+	local id = #state.tiles + 1
+	local t = { id=id, bx=bx, by=by, z=z, face=nil, node=nil, alive=true }
+	t.node = create_tile_node(t)
+	table.insert(state.tiles, t)
+	occ_set(z, bx, by, id)
+end
+
+-- ================= Input =================
+function on_input(self, action_id, action)
+	if action.x then self.action_x = action.x end
+	if action.y then self.action_y = action.y end
+
+	-- Left mouse button (touch may map to this in GUI pipelines).
+	if action.released and action_id == hash("mouse_button_left") then
+		local x, y = action.x, action.y
+		if state.mode == MODE_EDITOR then
+			add_tile_from_screen(x, y)
+			state.show_msg = nil
+		else
+			local t = try_pick_tile(x, y)
+			if t and t.alive and is_tile_free(t) then
+				if not state.selected then
+					state.selected = t.id
+				else
+					local s
+					for _,tt in ipairs(state.tiles) do if tt.id == state.selected then s = tt break end end
+					if s and try_remove_pair(s, t) then
+						state.selected = nil
+						local any_alive = false
+						for _,tt in ipairs(state.tiles) do if tt.alive then any_alive = true break end end
+						if not any_alive then
+							state.show_msg = "Victory!"
+						elseif not has_moves_play() then
+							state.show_msg = "No moves — defeat"
+						end
+					else
+						state.selected = t.id
+					end
+				end
+			else
+				state.selected = nil
+			end
+		end
+		return
+	end
+
+	-- Right mouse button
+	if action.released and action_id == hash("mouse_button_right") then
+		local x, y = action.x, action.y
+		if state.mode == MODE_EDITOR then
+			local t = try_pick_tile(x, y)
+			if t and t.alive then
+				remove_tile(t)
+				state.show_msg = nil
+			end
+			state.show_msg = nil
+		else
+			state.selected = nil
+		end
+		return
+	end
+end
+
+-- ================= Update =================
+function update(self, dt)
+	-- Dynamic scale/position every frame (keeps aspect and centering on resize).
+	recompute_layout_metrics()
+
+	-- Timer runs in play mode only.
+	state.timer = state.timer + ((state.mode == MODE_PLAY) and dt or 0)
+
+	-- Grid upkeep
+	ensure_grid_nodes()
+	layout_grid()
+
+	-- Ghost preview under cursor (editor only)
+	if state.mode == MODE_EDITOR then
+		local mx, my = self.action_x, self.action_y
+		if mx and my then
+			local bx, by, z = find_add_slot_from_screen(mx, my)
+			if bx then
+				ghost_show_at(bx, by, z or 0)
+			else
+				ghost_hide()
+			end
+		else
+			ghost_hide()
+		end
+	else
+		ghost_hide()
+	end
+
+	-- Tiles: update positions (in case of resize) and selection tint
+	for _,t in ipairs(state.tiles) do
+		if t.alive and t.node then
+			local px, py = to_px(t.bx, t.by, t.z)
+			gui.set_position(t.node, vmath.vector3(px, py, 0))
+			gui.set_color(t.node, (state.mode == MODE_PLAY and state.selected == t.id) and COLOR_PICK1 or COLOR_WHITE)
+		end
+	end
+
+	-- Enforce draw order (grid below tiles).
+	apply_render_order()
+
+	-- ImGui panel
+	draw_toolbar(dt)
+end

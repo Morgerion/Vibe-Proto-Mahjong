@@ -1,0 +1,14 @@
+name: "main"
+scale_along_z: 0
+embedded_instances {
+  id: "GUI"
+  data: "components {\n"
+  "  id: \"main\"\n"
+  "  component: \"/main/main.gui\"\n"
+  "}\n"
+  "components {\n"
+  "  id: \"imgui\"\n"
+  "  component: \"/imgui/imgui.script\"\n"
+  "}\n"
+  ""
+}

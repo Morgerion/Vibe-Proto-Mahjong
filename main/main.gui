@@ -1,0 +1,7 @@
+script: "/main/main.gui_script"
+textures {
+  name: "tiles"
+  texture: "/assets/tiles.atlas"
+}
+material: "/builtins/materials/gui.material"
+adjust_reference: ADJUST_REFERENCE_PARENT
